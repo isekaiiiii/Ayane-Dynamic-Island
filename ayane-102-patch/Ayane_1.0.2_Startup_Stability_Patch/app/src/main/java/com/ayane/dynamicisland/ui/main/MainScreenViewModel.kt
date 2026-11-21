@@ -1,0 +1,213 @@
+package com.ayane.dynamicisland.ui.main
+
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.graphics.drawable.Drawable
+import android.widget.Toast
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.ayane.dynamicisland.data.SettingsRepository
+import com.ayane.dynamicisland.model.IslandSettings
+import com.ayane.dynamicisland.service.IslandOverlayService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+data class AppItem(
+    val packageName: String,
+    val appName: String,
+    val icon: Drawable? = null,
+    val isBlocked: Boolean = false
+)
+
+class MainScreenViewModel(private val repository: SettingsRepository) : ViewModel() {
+
+    val settings: StateFlow<IslandSettings> = repository.settingsFlow
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = IslandSettings()
+        )
+
+    private val _pendingPermissions = MutableStateFlow<List<PermissionItem>>(emptyList())
+    val pendingPermissions: StateFlow<List<PermissionItem>> = _pendingPermissions.asStateFlow()
+
+    private val _installedApps = MutableStateFlow<List<AppItem>>(emptyList())
+    val installedApps: StateFlow<List<AppItem>> = _installedApps.asStateFlow()
+
+    private val _isLoadingApps = MutableStateFlow(false)
+    val isLoadingApps: StateFlow<Boolean> = _isLoadingApps.asStateFlow()
+
+    sealed interface UpdateState {
+        data object Idle : UpdateState
+        data object Checking : UpdateState
+        data object UpToDate : UpdateState
+        data class Available(val release: com.ayane.dynamicisland.util.AppReleaseInfo) : UpdateState
+        data class Downloading(val release: com.ayane.dynamicisland.util.AppReleaseInfo, val progress: Float) : UpdateState
+        data class Error(val message: String) : UpdateState
+    }
+
+    private val _updateState = MutableStateFlow<UpdateState>(UpdateState.Idle)
+    val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
+
+    private val _showUpdateSheet = MutableStateFlow(false)
+    val showUpdateSheet: StateFlow<Boolean> = _showUpdateSheet.asStateFlow()
+
+    fun dismissUpdateSheet() {
+        _showUpdateSheet.value = false
+    }
+
+    fun openUpdateSheet() {
+        if (_updateState.value is UpdateState.Available || _updateState.value is UpdateState.Downloading) {
+            _showUpdateSheet.value = true
+        }
+    }
+
+    fun checkForUpdates(context: Context) {
+        viewModelScope.launch {
+            _updateState.value = UpdateState.Checking
+            when (val result = com.ayane.dynamicisland.util.UpdateManager.checkGithubUpdates(context)) {
+                is com.ayane.dynamicisland.util.UpdateCheckResult.UpdateAvailable -> {
+                    _updateState.value = UpdateState.Available(result.release)
+                    _showUpdateSheet.value = true
+                }
+                is com.ayane.dynamicisland.util.UpdateCheckResult.UpToDate -> {
+                    _updateState.value = UpdateState.UpToDate
+                }
+                is com.ayane.dynamicisland.util.UpdateCheckResult.Error -> {
+                    _updateState.value = UpdateState.Error(result.message)
+                }
+            }
+        }
+    }
+
+    fun downloadAndInstallUpdate(context: Context, release: com.ayane.dynamicisland.util.AppReleaseInfo) {
+        viewModelScope.launch {
+            _updateState.value = UpdateState.Downloading(release, 0.01f)
+            val apkFile = com.ayane.dynamicisland.util.UpdateManager.downloadApk(context, release.downloadUrl) { p ->
+                _updateState.value = UpdateState.Downloading(release, p)
+            }
+            if (apkFile != null) {
+                com.ayane.dynamicisland.util.UpdateManager.installApk(context, apkFile)
+                _showUpdateSheet.value = false
+                _updateState.value = UpdateState.UpToDate
+            } else {
+                _updateState.value = UpdateState.Error("Failed to download update APK")
+            }
+        }
+    }
+
+    fun refreshUpdateStateOnResume(context: Context) {
+        val current = com.ayane.dynamicisland.util.UpdateManager.getCurrentVersion(context)
+        val state = _updateState.value
+        if (state is UpdateState.Available) {
+            if (!com.ayane.dynamicisland.util.UpdateManager.isNewerVersion(state.release.version, current)) {
+                _updateState.value = UpdateState.UpToDate
+                _showUpdateSheet.value = false
+            }
+        }
+    }
+
+    fun checkPermissions(context: Context) {
+        _pendingPermissions.value = try {
+            PermissionHelper.getPendingPermissions(context)
+        } catch (error: Exception) {
+            Log.e("AyaneStartup", "Không thể kiểm tra quyền lúc mở ứng dụng", error)
+            emptyList()
+        }
+    }
+
+    fun updateSettings(update: (IslandSettings) -> IslandSettings) {
+        viewModelScope.launch {
+            repository.updateSettings(update)
+        }
+    }
+
+    fun toggleEnabled(context: Context, enabled: Boolean) {
+        viewModelScope.launch {
+            if (enabled && !PermissionHelper.isOverlayGranted(context)) {
+                Toast.makeText(
+                    context,
+                    "Vui lòng cấp quyền Hiển thị trên ứng dụng khác trước.",
+                    Toast.LENGTH_LONG
+                ).show()
+                checkPermissions(context)
+                return@launch
+            }
+
+            if (!enabled) {
+                repository.updateSettings { it.copy(isEnabled = false) }
+                runCatching { IslandOverlayService.stop(context) }
+                return@launch
+            }
+
+            // Persist the enabled state before service creation so the service reads
+            // the correct settings during onCreate().
+            repository.updateSettings { it.copy(isEnabled = true) }
+            val started = IslandOverlayService.start(context)
+            if (!started) {
+                repository.updateSettings { it.copy(isEnabled = false) }
+                Toast.makeText(
+                    context,
+                    "Ayane chưa thể khởi động. Hãy kiểm tra quyền hiển thị nổi và thử lại.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    fun loadInstalledApps(context: Context) {
+        if (_installedApps.value.isNotEmpty()) return
+        viewModelScope.launch {
+            _isLoadingApps.value = true
+            val apps = withContext(Dispatchers.IO) {
+                val pm = context.packageManager
+                val intent = Intent(Intent.ACTION_MAIN, null).apply {
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                }
+                val resolveInfos = pm.queryIntentActivities(intent, 0)
+                val currentBlocked = settings.value.blockedPackages
+
+                resolveInfos.mapNotNull { resolveInfo ->
+                    val pkg = resolveInfo.activityInfo.packageName
+                    if (pkg == context.packageName) return@mapNotNull null
+                    val name = resolveInfo.loadLabel(pm).toString()
+                    val icon = resolveInfo.loadIcon(pm)
+                    AppItem(
+                        packageName = pkg,
+                        appName = name,
+                        icon = icon,
+                        isBlocked = currentBlocked.contains(pkg)
+                    )
+                }.sortedBy { it.appName.lowercase() }
+            }
+            _installedApps.value = apps
+            _isLoadingApps.value = false
+        }
+    }
+
+    fun toggleAppBlocked(packageName: String) {
+        viewModelScope.launch {
+            val currentBlocked = settings.value.blockedPackages.toMutableSet()
+            if (currentBlocked.contains(packageName)) {
+                currentBlocked.remove(packageName)
+            } else {
+                currentBlocked.add(packageName)
+            }
+            repository.updateSettings { it.copy(blockedPackages = currentBlocked) }
+            _installedApps.value = _installedApps.value.map { app ->
+                if (app.packageName == packageName) {
+                    app.copy(isBlocked = currentBlocked.contains(packageName))
+                } else app
+            }
+        }
+    }
+}
